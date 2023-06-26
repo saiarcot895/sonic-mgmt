@@ -120,3 +120,41 @@ def test_warm_upgrade_sad_path(localhost, duthosts, ptfhost, rand_one_dut_hostna
             pytest_assert(reboot_cause == upgrade_type,
                           "Reboot cause {} did not match the trigger - {}".format(reboot_cause, upgrade_type))
             check_services(duthost)
+
+@pytest.mark.device_type('vs')
+def test_multi_hop_upgrade_path(localhost, duthosts, ptfhost, rand_one_dut_hostname,
+                      nbrhosts, fanouthosts, tbinfo, restore_image,
+                      get_advanced_reboot, verify_dut_health, advanceboot_loganalyzer,
+                      upgrade_path_lists):
+    duthost = duthosts[rand_one_dut_hostname]
+    upgrade_type, from_list_images, to_list_images, _ = upgrade_path_lists
+    from_image = from_list_images.split(',')[0]
+    to_list = to_list_images.split(',')
+    assert (from_image and to_list)
+
+    # Install base image
+    logger.info("Installing {}".format(from_image))
+    target_version = install_sonic(duthost, from_image, tbinfo)
+    # Perform a cold reboot
+    logger.info("Cold reboot the DUT to make the base image as current")
+    reboot(duthost, localhost)
+    check_sonic_version(duthost, target_version)
+
+    for to_image in to_list:
+        logger.info("Test {} upgrade path to {}".format(upgrade_type, to_image))
+
+        # Install target image
+        logger.info("Installing {}".format(to_image))
+        install_sonic(duthost, to_image, tbinfo)
+        if upgrade_type == REBOOT_TYPE_COLD:
+            # advance-reboot test (on ptf) does not support cold reboot yet
+            reboot(duthost, localhost)
+        else:
+            advancedReboot = get_advanced_reboot(rebootType=get_reboot_command(duthost, upgrade_type),
+                                                 advanceboot_loganalyzer=advanceboot_loganalyzer)
+            advancedReboot.runRebootTestcase()
+        reboot_cause = get_reboot_cause(duthost)
+        logger.info("Check reboot cause. Expected cause {}".format(upgrade_type))
+        pytest_assert(reboot_cause == upgrade_type,
+                      "Reboot cause {} did not match the trigger - {}".format(reboot_cause, upgrade_type))
+        check_services(duthost)
