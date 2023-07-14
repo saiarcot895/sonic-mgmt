@@ -872,19 +872,18 @@ def get_advanced_reboot(request, duthosts, enum_rand_one_per_hwsku_frontend_host
         @param tbinfo: fixture provides information about testbed
     """
     duthost = duthosts[enum_rand_one_per_hwsku_frontend_hostname]
-    instances = []
+    mostRecentInstance = None
 
     def get_advanced_reboot(**kwargs):
         """
         API that returns instances of AdvancedReboot class
         """
-        assert len(instances) == 0, "Only one instance of reboot data is allowed"
         advancedReboot = AdvancedReboot(request, duthosts, duthost, ptfhost, localhost, tbinfo, creds, **kwargs)
-        instances.append(advancedReboot)
+        mostRecentInstance = advancedReboot
         return advancedReboot
 
     yield get_advanced_reboot
 
     # Perform clean up
-    for s in instances:
-        s.tearDown()
+    if mostRecentInstance:
+        mostRecentInstance.tearDown()
