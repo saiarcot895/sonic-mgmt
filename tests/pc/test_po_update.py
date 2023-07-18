@@ -22,7 +22,7 @@ pytestmark = [
 
 
 @pytest.fixture(autouse=True)
-def ignore_expected_loganalyzer_exceptions(enum_rand_one_per_hwsku_frontend_hostname, loganalyzer):
+def ignore_expected_loganalyzer_exceptions(duthosts, enum_rand_one_per_hwsku_frontend_hostname, loganalyzer):
     """
         Ignore expected failures logs during test execution.
 
@@ -43,6 +43,12 @@ def ignore_expected_loganalyzer_exceptions(enum_rand_one_per_hwsku_frontend_host
             (".*ERR syncd#syncd: :- translate_vid_to_rid: unable to get RID for VID.*"),
         ]
         loganalyzer[enum_rand_one_per_hwsku_frontend_hostname].ignore_regex.extend(ignoreRegex)
+        platform = duthosts[enum_rand_one_per_hwsku_frontend_hostname].facts['platform']
+        if platform == 'x86_64-mlnx_msn2700-r0':
+            # 2700 CPU is on the weaker side, and PC removal events can get queued up. Because of processing order,
+            # the PC removal might be attempted before the PC member deletion, leading to this error message.
+            loganalyzer[enum_rand_one_per_hwsku_frontend_hostname].ignore_regex.append(
+                    ".*ERR swss#orchagent: :- removeLag: Failed to remove non-empty LAG PortChannel999")
 
     yield
 
