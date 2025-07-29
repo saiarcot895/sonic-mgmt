@@ -258,7 +258,7 @@ class ReloadTest(BaseTest):
         self.asic_state_time = {}  # Recording last asic state entering time
         self.asic_vlan_reach = []  # Recording asic vlan reachability
         self.recording = False  # Knob for recording asic_vlan_reach
-        self.finalizer_state = ''
+        self.warm_restart_state = ''
         # light_probe:
         #    True : when one direction probe fails, don't probe another.
         #    False: when one direction probe fails, continue probe another.
@@ -1020,23 +1020,25 @@ class ReloadTest(BaseTest):
         watcher = self.pool.apply_async(self.reachability_watcher)      # noqa: F841
         time.sleep(5)
 
-    def get_warmboot_finalizer_state(self):
-        self.log("get the finalizer_state with: 'sudo systemctl is-active warmboot-finalizer.service'")
+    def get_warm_restart_state(self):
+        self.log("get the finalizer_state with: 'sonic-db-cli STATE_DB HGET WARM_RESTART_ENABLE_TABLE|system enable'")
         stdout, stderr, _ = self.dut_connection.execCommand(
-            'sudo systemctl is-active warmboot-finalizer.service')
+            "sonic-db-cli STATE_DB HGET 'WARM_RESTART_ENABLE_TABLE|system' enable")
         if stderr:
-            self.fails['dut'].add("Error collecting Finalizer state. stderr: {}, stdout:{}".format(
-                str(stderr), str(stdout)))
-            self.log("Error collecting Finalizer state. stderr: {}, stdout:{}".format(str(stderr), str(stdout)))
-            raise Exception("Error collecting Finalizer state. stderr: {}, stdout:{}".format(
-                str(stderr), str(stdout)))
+            error_message = "Error collecting warm restart state. stderr: {}, stdout:{}".format(
+                str(stderr), str(stdout))
+            self.fails['dut'].add(error_message)
+            self.log(error_message)
+            raise Exception(error_message)
         if not stdout:
             self.log('Finalizer state not returned from DUT')
             return ''
 
-        finalizer_state = stdout[0].strip()
-        self.log("The returned finalizer_state is {}".format(finalizer_state))
-        return finalizer_state
+        stdout = ''.join(stdout)
+
+        warm_restart_state = stdout.strip()
+        self.log("The returned warm restart state is {}".format(warm_restart_state))
+        return warm_restart_state
 
     def get_now_time(self):
         stdout, stderr, _ = self.dut_connection.execCommand(
@@ -1053,45 +1055,29 @@ class ReloadTest(BaseTest):
                 'Error collecting current date from DUT: empty value returned')
         return datetime.datetime.strptime(stdout[0].strip(), "%Y-%m-%d %H:%M:%S")
 
-    def check_warmboot_finalizer(self, finalizer_timeout):
+    def check_warm_restart_state(self, finalizer_timeout):
         self.wait_until_control_plane_up()
-        dut_datetime = self.get_now_time()
-        self.log('waiting for warmboot-finalizer service to become activating')
-        self.finalizer_state = self.get_warmboot_finalizer_state()
 
-        while self.finalizer_state != 'activating':
-            time.sleep(1)
-            dut_datetime_after_ssh = self.get_now_time()
-            time_passed = float(dut_datetime_after_ssh.strftime(
-                "%s")) - float(dut_datetime.strftime("%s"))
-            if time_passed > finalizer_timeout:
-                self.fails['dut'].add(
-                    'warmboot-finalizer never reached state "activating"')
-                self.log('TimeoutError: warmboot-finalizer never reached state "activating"')
-                raise TimeoutError
-            self.finalizer_state = self.get_warmboot_finalizer_state()
-
-        self.log('waiting for warmboot-finalizer service to finish')
-        self.finalizer_state = self.get_warmboot_finalizer_state()
-        self.log('warmboot finalizer service state {}'.format(self.finalizer_state))
+        self.log('waiting for warm restart flag to be cleared')
+        self.warm_restart_state = self.get_warm_restart_state()
+        self.log('warm restart flag state {}'.format(self.warm_restart_state))
         count = 0
-        while self.finalizer_state != 'inactive':
+        while self.warm_restart_state == 'true':
             try:
-                self.finalizer_state = self.get_warmboot_finalizer_state()
+                self.warm_restart_state = self.get_warm_restart_state()
             except Exception:
                 traceback_msg = traceback.format_exc()
-                self.log("Exception happened during get warmboot finalizer service state: {}".format(traceback_msg))
+                self.log("Exception happened during get warm restart flag state: {}".format(traceback_msg))
                 raise
 
-            self.log('warmboot finalizer service state {}'.format(self.finalizer_state))
+            self.log('warm restart flag state {}'.format(self.warm_restart_state))
             time.sleep(10)
             if count * 10 > int(self.test_params['warm_up_timeout_secs']):
-                self.fails['dut'].add(
-                    'warmboot-finalizer.service did not finish')
-                self.log('TimeoutError: warmboot-finalizer.service did not finish')
+                self.fails['dut'].add('warm restart flag did not get cleared')
+                self.log('TimeoutError: warm restart flag did not get cleared')
                 raise TimeoutError
             count += 1
-        self.log('warmboot-finalizer service finished')
+        self.log('warm restart flag cleared')
 
     def wait_until_control_plane_down(self):
         self.log("Wait until Control plane is down")
@@ -1432,7 +1418,7 @@ class ReloadTest(BaseTest):
             if 'warm-reboot' in self.reboot_type or 'fast-reboot' in self.reboot_type:
                 finalizer_timeout = 60 + \
                     self.test_params['reboot_limit_in_seconds']
-                thr = threading.Thread(target=self.check_warmboot_finalizer,
+                thr = threading.Thread(target=self.check_warm_restart_state,
                                        kwargs={'finalizer_timeout': finalizer_timeout})
                 thr.setDaemon(True)
                 thr.start()
@@ -1455,7 +1441,7 @@ class ReloadTest(BaseTest):
                     time.sleep(0.5)
                 if self.warmboot_finalizer_thread.is_alive():
                     self.fails['dut'].add("Warmboot Finalizer hasn't finished for {} seconds. Finalizer state: {}"
-                                          .format(total_timeout, self.get_warmboot_finalizer_state()))
+                                          .format(total_timeout, self.get_warm_restart_state()))
 
             # Check sonic version after reboot
             self.check_sonic_version_after_reboot()
@@ -1823,7 +1809,7 @@ class ReloadTest(BaseTest):
 
             while True:
                 time.sleep(self.send_interval)
-                if self.reboot_start and self.finalizer_state == "inactive":
+                if self.reboot_start and self.warm_restart_state != "true":
                     # keep sending packets until device reboots and finalizer enters inactive state
                     break
                 payload = '0' * 60 + str(self.sent_packet_count)
