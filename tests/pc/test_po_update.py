@@ -1,4 +1,5 @@
 import dataclasses
+import json
 import random
 import multiprocessing
 import time
@@ -89,6 +90,33 @@ def _check_ip_removed(asichost, portchannel, is_ipv6=False):
     return not int_facts['ansible_interface_facts'][portchannel].get('ipv4')
 
 
+def get_vm_neighbor_interfaces(nbrhosts, tbinfo, peer_device):
+    """Map minigraph neighbor port to the interface name on converged cEOS."""
+    peer_info = nbrhosts[peer_device]
+    if peer_info.get('is_multi_vrf_peer') and peer_info.get('multi_vrf_data'):
+        return nbrhosts[peer_device]['multi_vrf_data']['intf_config']
+
+    props = tbinfo.get('topo', {}).get('properties', {})
+    convergence_data = props.get('convergence_data', {})
+    if props.get('topo_is_multi_vrf') and convergence_data.get('convergence_mapping'):
+        for primary, logical_names in convergence_data['convergence_mapping'].items():
+            if peer_device in logical_names:
+                intf_mapping = convergence_data['converged_peers'][primary]['intf_mapping']
+                return intf_mapping[peer_device]['intf_config']
+
+    return peer_info['conf']['interfaces']
+
+
+def get_vm_peer_for_dut_intf(nbrhosts, tbinfo, mg_facts, dut_intf):
+    """Return (vm_host, neighbor_intf_on_ceos, logical_peer_name) for a DUT interface."""
+    peer_device = mg_facts['minigraph_neighbors'][dut_intf]['name']
+    vm_host = nbrhosts[peer_device]['host']
+    vm_interfaces = get_vm_neighbor_interfaces(nbrhosts, tbinfo, peer_device)
+    member_interfaces = [intf for intf in vm_interfaces.keys() if intf.startswith("Ethernet")]
+    lag_id = vm_interfaces[member_interfaces[0]]["lacp"]
+    return vm_host, member_interfaces, lag_id
+
+
 def has_bgp_neighbors(duthost, portchannel, is_ipv6=False):
     if is_ipv6:
         return duthost.shell("show ipv6 int | grep {} | awk '{{print $4}}'".format(portchannel))['stdout'] != 'N/A'
@@ -99,13 +127,15 @@ def pc_active(asichost, portchannel):
     return asichost.interface_facts()['ansible_facts']['ansible_interface_facts'][portchannel]['active']
 
 
-def test_po_update(duthosts, enum_rand_one_per_hwsku_frontend_hostname, enum_frontend_asic_index, tbinfo):
+@pytest.mark.parametrize("portchannel_type", ["normal", "fallback-single", "fallback-static"])
+def test_po_update(duthosts, nbrhosts, enum_rand_one_per_hwsku_frontend_hostname, enum_frontend_asic_index, tbinfo, portchannel_type):
     """
     test port channel add/deletion as well ip address configuration
     """
     duthost = duthosts[enum_rand_one_per_hwsku_frontend_hostname]
     asichost = duthost.asic_instance(enum_frontend_asic_index)
     int_facts = asichost.interface_facts()['ansible_facts']
+    mg_facts = asichost.get_extended_minigraph_facts(tbinfo)
 
     port_channels_data = asichost.get_portchannels_and_members_in_ns(tbinfo)
     if not port_channels_data:
@@ -158,6 +188,8 @@ def test_po_update(duthosts, enum_rand_one_per_hwsku_frontend_hostname, enum_fro
     logging.info("portchannel_members=%s" % portchannel_members)
     logging.info("is_ipv6=%s" % is_ipv6)
 
+    (vm_host, vm_member_interfaces, vm_lag_id) = get_vm_peer_for_dut_intf(nbrhosts, tbinfo, mg_facts, portchannel_members[0])
+
     try:
         # Step 1: Remove portchannel members from portchannel
         for member in portchannel_members:
@@ -175,8 +207,29 @@ def test_po_update(duthosts, enum_rand_one_per_hwsku_frontend_hostname, enum_fro
             wait_until(120, 10, 0, asichost.check_bgp_statistic, bgp_state_key, 1)
             or not wait_until(10, 10, 0, pc_active, asichost, portchannel))
 
+        if portchannel_type != "normal":
+            eos_commands = ["config"]
+            for vm_member_interface in vm_member_interfaces:
+                eos_commands += [
+                    f"interface {vm_member_interface}",
+                    "no channel-group"
+                    ]
+
+            for vm_member_interface in vm_member_interfaces:
+                eos_commands += [
+                    f"interface {vm_member_interface}",
+                    f"channel-group {vm_lag_id} mode on"
+                    ]
+
+            vm_host.eos_command(commands=eos_commands)
+
         # Step 3: Create tmp portchannel
-        asichost.config_portchannel(tmp_portchannel, "add")
+        if portchannel_type == "normal":
+            asichost.config_portchannel(tmp_portchannel, "add")
+        elif portchannel_type == "fallback-single":
+            asichost.config_portchannel(tmp_portchannel, "add", fallback=True)
+        elif portchannel_type == "fallback-static":
+            asichost.config_portchannel(tmp_portchannel, "add", fallback=True, fallback_mode="static")
         create_tmp_portchannel = True
 
         # Step 4: Add portchannel member to tmp portchannel
@@ -202,6 +255,27 @@ def test_po_update(duthosts, enum_rand_one_per_hwsku_frontend_hostname, enum_fro
             has_bgp_neighbors(duthost, tmp_portchannel, is_ipv6) and
             wait_until(120, 10, 0, asichost.check_bgp_statistic, bgp_state_key, 0)
             or wait_until(10, 10, 0, pc_active, asichost, tmp_portchannel))
+
+        lag_facts = json.loads(asichost.command(f"teamdctl {tmp_portchannel} state dump")["stdout"])
+        one_fallback_member_found = False
+        for member in portchannel_members:
+            current_member_state = lag_facts["ports"][member]["runner"]["state"]
+            if portchannel_type == "normal":
+                pytest_assert(current_member_state == "current",
+                              f"{member} is in {current_member_state} instead of expected state")
+            elif portchannel_type == "fallback-single":
+                if current_member_state == "fallback":
+                    pytest_assert(not one_fallback_member_found,
+                                  "Second fallback member found when there should be only one")
+                    one_fallback_member_found = True
+                else:
+                    pytest_assert(current_member_state == "defaulted",
+                                  f"{member} is in {current_member_state} instead of expected state")
+            elif portchannel_type == "fallback-static":
+                pytest_assert(current_member_state == "fallback",
+                              f"{member} is in {current_member_state} instead of expected state")
+        if portchannel_type == "fallback-single":
+            pytest_assert(one_fallback_member_found, "No fallback member ports found")
     finally:
         # Recover all states
         # The T1 topology golden config (smartswitch_t1.json) installs a static route
@@ -231,6 +305,23 @@ def test_po_update(duthosts, enum_rand_one_per_hwsku_frontend_hostname, enum_fro
         _wait_until_pc_members_removed(asichost, tmp_portchannel)
         if create_tmp_portchannel:
             asichost.config_portchannel(tmp_portchannel, "del")
+
+        if portchannel_type != "normal":
+            eos_commands = ["config"]
+            for vm_member_interface in vm_member_interfaces:
+                eos_commands += [
+                    f"interface {vm_member_interface}",
+                    "no channel-group"
+                    ]
+
+            for vm_member_interface in vm_member_interfaces:
+                eos_commands += [
+                    f"interface {vm_member_interface}",
+                    f"channel-group {vm_lag_id} mode active"
+                    ]
+
+            vm_host.eos_command(commands=eos_commands)
+
         if remove_portchannel_ip:
             asichost.config_ip_intf(portchannel, portchannel_ip + "/" + prefix_len, "add")
         if remove_portchannel_members:
@@ -393,22 +484,7 @@ def run_traffic_test_during_po_change(duthost, duthosts, asichost, ptfadapter, i
             or wait_until(10, 10, 0, pc_active, asichost, out_pc.name))
 
 
-def test_po_update_io_no_loss(
-        duthosts,
-        enum_rand_one_per_hwsku_frontend_hostname,
-        enum_frontend_asic_index,
-        tbinfo,
-        ptfadapter,
-        reload_testbed_on_failed):
-    # GIVEN a lag topology, keep sending packets between 2 port channels
-    # WHEN delete/add different members of a port channel
-    # THEN no packets shall loss
-    duthost = duthosts[enum_rand_one_per_hwsku_frontend_hostname]
-    asichost = duthost.asic_instance(enum_frontend_asic_index)
-    mg_facts = asichost.get_extended_minigraph_facts(tbinfo)
-
-    dut_mg_facts = duthost.get_extended_minigraph_facts(tbinfo)
-
+def select_ingress_and_egress_port_channels(duthost, enum_frontend_asic_index, mg_facts, dut_mg_facts, min_members=2):
     # generate ip-pc pairs, be like:[("10.0.0.56", "10.0.0.57", "PortChannel0001")]
     pcs = [PortChannelPair(name=pc["attachto"], local_address=pc["addr"], peer_address=pc["peer_addr"],
                            namespace=dut_mg_facts["minigraph_portchannels"][pc["attachto"]]['namespace'])
@@ -429,7 +505,7 @@ def test_po_update_io_no_loss(
         dataclasses.replace(pair, ports=mg_facts["minigraph_portchannels"][pair.name]["members"])
         for pair in pcs
         if pair.name in mg_facts['minigraph_portchannels']
-        and len(mg_facts["minigraph_portchannels"][pair.name]["members"]) >= 2]
+        and len(mg_facts["minigraph_portchannels"][pair.name]["members"]) >= min_members]
 
     if len(out_pcs) < 1:
         pytest.skip(
@@ -443,11 +519,32 @@ def test_po_update_io_no_loss(
     if in_pc.name == out_pc.name:
         in_pc = selected_pcs[1]
 
+    return (in_pc, out_pc)
+
+
+def test_po_update_io_no_loss(
+        duthosts,
+        enum_rand_one_per_hwsku_frontend_hostname,
+        enum_frontend_asic_index,
+        tbinfo,
+        ptfadapter,
+        reload_testbed_on_failed):
+    # GIVEN a lag topology, keep sending packets between 2 port channels
+    # WHEN delete/add different members of a port channel
+    # THEN no packets shall loss
+    duthost = duthosts[enum_rand_one_per_hwsku_frontend_hostname]
+    asichost = duthost.asic_instance(enum_frontend_asic_index)
+    mg_facts = asichost.get_extended_minigraph_facts(tbinfo)
+
+    dut_mg_facts = duthost.get_extended_minigraph_facts(tbinfo)
+
+    (in_pc, out_pc) = select_ingress_and_egress_port_channels(duthost, enum_frontend_asic_index, mg_facts, dut_mg_facts)
+
     # use first port of in_pc as input port
     # all ports in out_pc will be output/forward ports
     in_ptf_index = dut_mg_facts["minigraph_ptf_indices"][in_pc.ports[0]]
     out_ptf_indices = [mg_facts["minigraph_ptf_indices"][port] for port in out_pc.ports]
-    logging.info(f"selected_pcs is: {selected_pcs}, in_ptf_index is {in_ptf_index}, out_ptf_indices is {out_ptf_indices}")
+    logging.info(f"in_pc is {in_pc}, out_pc is {out_pc}, in_ptf_index is {in_ptf_index}, out_ptf_indices is {out_ptf_indices}")
 
     def del_add_members(asichost, pc_name, sending_flag, finished_flag):
         # wait for packets sending started, then starts to update pc members
@@ -486,72 +583,16 @@ def test_po_update_io_no_loss_with_fallback(
 
     dut_mg_facts = duthost.get_extended_minigraph_facts(tbinfo)
 
-    # generate ip-pc pairs, be like:[("10.0.0.56", "10.0.0.57", "PortChannel0001")]
-    pcs = [PortChannelPair(name=pc["attachto"], local_address=pc["addr"], peer_address=pc["peer_addr"],
-                           namespace=dut_mg_facts["minigraph_portchannels"][pc["attachto"]]['namespace'])
-           for pc in dut_mg_facts["minigraph_portchannel_interfaces"]
-           if ipaddress.ip_address(pc['peer_addr']).version == 4]
-    # generate pc tuples, fill in members,
-    # be like:[("10.0.0.56", "10.0.0.57", "PortChannel0001", ["Ethernet48", "Ethernet52"])]
-    for pair in pcs:
-        pair.ports = dut_mg_facts["minigraph_portchannels"][pair.name]["members"]
-
-    if len(pcs) < 2:
-        pytest.skip(
-            "Skip test as there are not enough port channels with members on asic {} on dut {}"
-            .format(enum_frontend_asic_index, duthost))
-
-    # generate out_pc tuples similar to pc tuples, but that are on the same asic as asichost
-    out_pcs = [
-        dataclasses.replace(pair, ports=mg_facts["minigraph_portchannels"][pair.name]["members"])
-        for pair in pcs
-        if pair.name in mg_facts['minigraph_portchannels']
-        and len(mg_facts["minigraph_portchannels"][pair.name]["members"]) >= min_links_in_portchannel]
-
-    if len(out_pcs) < 1:
-        pytest.skip("Skip test as there are not enough port channels with "
-                    f"{min_links_in_portchannel} links in current topology.")
-    # Select out pc from the port channels that are on the same asic as asichost
-    out_pc: PortChannelPair = random.sample(out_pcs, k=1)[0]
-    selected_pcs = random.sample(pcs, k=2)
-
-    in_pc: PortChannelPair = selected_pcs[0]
-    # Make sure the picked in_pc is not the same as the selected out_pc
-    if in_pc.name == out_pc.name:
-        in_pc = selected_pcs[1]
+    (in_pc, out_pc) = select_ingress_and_egress_port_channels(duthost, enum_frontend_asic_index, mg_facts,
+                                                              dut_mg_facts, min_members=min_links_in_portchannel)
 
     # use first port of in_pc as input port
     # all ports in out_pc will be output/forward ports
     in_ptf_index = dut_mg_facts["minigraph_ptf_indices"][in_pc.ports[0]]
     out_ptf_indices = [mg_facts["minigraph_ptf_indices"][port] for port in out_pc.ports]
-    logging.info(f"selected_pcs: {selected_pcs}, in_ptf_index: {in_ptf_index}, out_ptf_indices: {out_ptf_indices}")
+    logging.info(f"in_pc is {in_pc}, out_pc is {out_pc}, in_ptf_index is {in_ptf_index}, out_ptf_indices is {out_ptf_indices}")
 
-    def get_vm_neighbor_interfaces(peer_device):
-        """Map minigraph neighbor port to the interface name on converged cEOS."""
-        peer_info = nbrhosts[peer_device]
-        if peer_info.get('is_multi_vrf_peer') and peer_info.get('multi_vrf_data'):
-            return nbrhosts[peer_device]['multi_vrf_data']['intf_config']
-
-        props = tbinfo.get('topo', {}).get('properties', {})
-        convergence_data = props.get('convergence_data', {})
-        if props.get('topo_is_multi_vrf') and convergence_data.get('convergence_mapping'):
-            for primary, logical_names in convergence_data['convergence_mapping'].items():
-                if peer_device in logical_names:
-                    intf_mapping = convergence_data['converged_peers'][primary]['intf_mapping']
-                    return intf_mapping[peer_device]['intf_config']
-
-        return peer_info['conf']['interfaces']
-
-    def get_vm_peer_for_dut_intf(dut_intf):
-        """Return (vm_host, neighbor_intf_on_ceos, logical_peer_name) for a DUT interface."""
-        peer_device = mg_facts['minigraph_neighbors'][dut_intf]['name']
-        vm_host = nbrhosts[peer_device]['host']
-        vm_interfaces = get_vm_neighbor_interfaces(peer_device)
-        member_interfaces = [intf for intf in vm_interfaces.keys() if intf.startswith("Ethernet")]
-        lag_id = vm_interfaces[member_interfaces[0]]["lacp"]
-        return vm_host, member_interfaces, lag_id
-
-    (vm_host, vm_member_interfaces, vm_lag_id) = get_vm_peer_for_dut_intf(out_pc.ports[0])
+    (vm_host, vm_member_interfaces, vm_lag_id) = get_vm_peer_for_dut_intf(nbrhosts, tbinfo, mg_facts, out_pc.ports[0])
 
     eos_commands = ["config"]
     for vm_member_interface in vm_member_interfaces:
